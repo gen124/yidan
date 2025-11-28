@@ -1,0 +1,39 @@
+data:
+  train_csv: "./data/train_manifest.csv"
+  val_csv: "./data/val_manifest.csv"
+  input_size: [192,192,128]
+model:
+  in_channels: 3
+  base_channels: 16
+  norm: group     # 'batch' or 'group' (group is better for small batch sizes)
+  num_groups: 8
+  dropout: 0.3
+  pretrained: false
+train:
+  batch_size: 2
+  lr: 1e-4
+  weight_decay: 1e-5
+  max_epochs: 80
+  patience: 10
+  device: "cuda"
+  seed: 42
+  balanced_sampler: true   # use weighted sampling to help small datasets
+  augmentations:
+    flip: true
+    noise_sigma: 0.01
+  stage1_epochs: 10
+  mil_iters: 2
+  mil_finetune_epochs: 5
+  mil_topk_percent: 0.10
+  lambda_slice: 1.0
+  alpha_node: 1.0
+  beta_smooth: 1e-3
+  freeze_encoder_head_only: true
+  final_epochs: 5
+explainer:
+  supervoxel_n_segments: 200
+  topk_path: 3
+  n_runs: 3
+  noise_std: 1e-3
+metadata:
+  abstract_pdf: "/mnt/data/Abstract #04870.pdf"
