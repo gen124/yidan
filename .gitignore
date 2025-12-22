@@ -1,0 +1,23 @@
+# Ignore data, outputs and environment
+data/
+outputs/
+checkpoints/
+data.zip
+*.nii
+*.nii.gz
+
+# Python envs
+.venv/
+env/
+venv/
+
+# PyTorch artifacts
+*.pth
+*.ckpt
+
+# VS Code and OS
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
