@@ -29,10 +29,49 @@ import json
 from datetime import datetime
 import math
 import os
+import re
 
 from data_utils import PDVolDataset, PatchDataset
 from models_patch import ResNet3D_PatchClassifier, PatchMILAggregator, build_patch_model
 from metrics import compute_metrics
+
+
+def _load_model_weights(model, ckpt_path, device):
+    """兼容两种格式：纯 state_dict 或 {'state_dict': ...}。"""
+    ck = torch.load(ckpt_path, map_location=device)
+    if isinstance(ck, dict) and 'state_dict' in ck:
+        state_dict = ck['state_dict']
+    else:
+        state_dict = ck    
+    # 处理 DataParallel 包装导致的前缀不匹配
+    is_model_dp = isinstance(model, nn.DataParallel)
+    is_ckpt_dp = any(k.startswith('module.') for k in state_dict.keys())
+    
+    if is_model_dp and not is_ckpt_dp:
+        # 模型有前缀，权重没有 -> 给权重加前缀
+        state_dict = {"module." + k: v for k, v in state_dict.items()}
+    elif not is_model_dp and is_ckpt_dp:
+        # 模型没有前缀，权重有 -> 给权重去前缀
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        
+    model.load_state_dict(state_dict, strict=True)
+
+
+def _find_latest_relabel_ckpt(output_dir):
+    """返回 (ckpt_path, completed_iters)。找不到则返回 (None, 0)。"""
+    if not os.path.isdir(output_dir):
+        return None, 0
+    best_iter = 0
+    best_path = None
+    for name in os.listdir(output_dir):
+        m = re.match(r"relabel_iter(\d+)\.pth$", name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if idx > best_iter:
+            best_iter = idx
+            best_path = os.path.join(output_dir, name)
+    return best_path, best_iter
 def _safe_bool(v, default=False):
     try:
         return bool(v)
@@ -50,7 +89,7 @@ def auto_tune_batch_and_workers(model, dataset, device, cfg):
 
     # 估计每样本显存占用
     est_per_sample = None
-    test_bs = min(bs_cfg, max(1, len(dataset)))
+    test_bs = min(bs_cfg, 8) # 只需要很小的 batch 就能估计显存
     loss_fn = nn.BCEWithLogitsLoss()
     non_blocking = _safe_bool(cfg['train'].get('pin_memory', True)) and (device.type == 'cuda')
 
@@ -64,7 +103,7 @@ def auto_tune_batch_and_workers(model, dataset, device, cfg):
             with torch.no_grad():
                 x = batch['volume'].to(device, non_blocking=non_blocking)
                 y = batch['label'].to(device, non_blocking=non_blocking)
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     logits = model(x)
                     loss = loss_fn(logits, y.view_as(logits))
                 _ = float(loss.item())
@@ -76,19 +115,31 @@ def auto_tune_batch_and_workers(model, dataset, device, cfg):
     tuned_bs = bs_cfg
     if device.type == 'cuda' and est_per_sample is not None and est_per_sample > 0:
         free, total = torch.cuda.mem_get_info(device)
-        target = int(total * 0.80)  # 目标 80% 总显存
+        
+        # 如果是 DataParallel，显存总量翻倍（假设双卡相同）
+        n_gpus = 1
+        if isinstance(model, nn.DataParallel):
+            n_gpus = len(model.device_ids)
+        
+        target = int(total * 0.70 * n_gpus)  # 降低到 70% 显存，预留更多缓冲
         # 预留当前常驻显存
-        reserved = total - free
+        reserved = (total - free) * n_gpus
         budget = max(0, target - reserved)
         max_by_mem = max(1, budget // est_per_sample)
-        tuned_bs = max(1, int(min(max_by_mem, bs_cfg * 4)))  # 不超过原始的4倍，避免过大震荡
-        print(f"[TUNE] per-sample≈{est_per_sample/1024**2:.1f}MB, total={total/1024**3:.1f}GB, free={free/1024**3:.1f}GB → batch_size={tuned_bs}")
+        
+        # 限制在配置的 4 倍以内，且最高不超过 1024，平衡显存与稳定性
+        tuned_bs = max(1, int(min(max_by_mem, bs_cfg * 4, 1024)))
+        # 确保是 n_gpus 的倍数，方便平分
+        tuned_bs = (tuned_bs // n_gpus) * n_gpus
+        
+        print(f"[TUNE] per-sample≈{est_per_sample/1024**2:.1f}MB, total={total*n_gpus/1024**3:.1f}GB, free={free*n_gpus/1024**3:.1f}GB → batch_size={tuned_bs}")
     else:
         print("[TUNE] 跳过显存估计(非CUDA或估计失败), 保持配置 batch_size")
 
     cpu_cnt = max(1, os.cpu_count() or 8)
-    tuned_workers = min( max(4, cpu_cnt // 2), int(cfg['train'].get('num_workers', 8)) )
-    # 允许增大到 CPU 一半, 但不超过配置上限
+    tuned_workers = min( 4, int(cfg['train'].get('num_workers', 4)) )
+    # 限制在 4 个 worker，避免内存占用过高
+    print(f"[TUNE] CPU cores={cpu_cnt} → num_workers={tuned_workers}")
     print(f"[TUNE] CPU cores={cpu_cnt} → num_workers={tuned_workers}")
     return int(tuned_bs), int(tuned_workers)
 
@@ -124,7 +175,7 @@ def train_epoch(model, loader, opt, device, cfg):
     n_batches = 0
     loss_fn = nn.BCEWithLogitsLoss()
     use_amp = bool(cfg['train'].get('amp', True)) and (device.type == 'cuda')
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     non_blocking = bool(cfg['train'].get('pin_memory', True)) and (device.type == 'cuda')
     
     for batch in tqdm(loader, desc='Training'):
@@ -132,7 +183,7 @@ def train_epoch(model, loader, opt, device, cfg):
         y = batch['label'].to(device, non_blocking=non_blocking)
         
         opt.zero_grad()
-        with torch.cuda.amp.autocast(enabled=use_amp):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             logits = model(x)
             loss = loss_fn(logits, y.view_as(logits))
         if use_amp:
@@ -165,7 +216,7 @@ def evaluate(model, loader, device, cfg):
         for batch in tqdm(loader, desc='Evaluating'):
             x = batch['volume'].to(device, non_blocking=non_blocking)
             y = batch['label'].to(device, non_blocking=non_blocking)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 logits = model(x)
                 loss = loss_fn(logits, y.view_as(logits))
             total_loss += loss.item()
@@ -187,21 +238,29 @@ def evaluate(model, loader, device, cfg):
     return metrics, avg_loss
 
 
-def infer_patch_scores(model, dataset, device, batch_size=16):
+def infer_patch_scores(model, dataset, device, batch_size=16, num_workers=0):
     """
     对所有patch进行推理,获取预测分数
     
     返回: {(patient_id, patch_idx): score}
     """
     model.eval()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_patch_batch)
+    # 强制使用 num_workers=0 以确保内存绝对安全，推理阶段 GPU 是瓶颈，CPU 串行提取 patch 足够
+    loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        collate_fn=collate_patch_batch,
+        num_workers=0,
+        pin_memory=(device.type=='cuda')
+    )
     
     patch_scores = {}
     
     with torch.no_grad():
         for batch in tqdm(loader, desc='Inferring patch scores'):
             x = batch['volume'].to(device)
-            with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
+            with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
                 logits = model(x)
             probs = torch.sigmoid(logits).cpu().numpy()
             
@@ -246,7 +305,7 @@ def relabel_patches(patch_scores, high_conf_threshold=0.8, low_conf_threshold=0.
     return refined_labels, stats
 
 
-def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
+def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
     """
     完整的Patch级迭代重标训练流程
     """
@@ -262,6 +321,8 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     
     print(f"[INFO] 使用设备: {device}")
     print(f"[INFO] 输出目录: {output_dir}")
+    if resume:
+        print(f"[INFO] 续训模式: {resume}")
     
     # =====================
     # 1. 加载数据集
@@ -283,6 +344,14 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     )
     print(f"  训练集: {len(train_dataset)} 个3D体积")
     print(f"  验证集: {len(val_dataset)} 个3D体积")
+
+    # [NEW] 预缓存数据到内存，避免多进程时每个 worker 都占用一份内存
+    print("[INFO] 正在预缓存数据到内存 (约占用 15GB)...")
+    from tqdm import tqdm
+    for i in tqdm(range(len(train_dataset)), desc="Caching Train"):
+        _ = train_dataset[i]
+    for i in tqdm(range(len(val_dataset)), desc="Caching Val"):
+        _ = val_dataset[i]
     
     # =====================
     # 2. 预训练阶段
@@ -310,6 +379,11 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     
     # 构建模型
     model = build_patch_model(cfg).to(device)
+
+    # 多GPU支持
+    if device.type == 'cuda' and torch.cuda.device_count() > 1:
+        print(f"[INFO] 检测到 {torch.cuda.device_count()} 个 GPU，启用 DataParallel")
+        model = nn.DataParallel(model)
     
     # 创建数据加载器(自动调参)
     batch_size_cfg = int(cfg['train'].get('batch_size', 2))
@@ -326,7 +400,7 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     persistent = bool(cfg['train'].get('persistent_workers', False)) and nw > 0
     # 训练时优先稳态，不超过配置的并行度
     train_workers = max(0, min(nw, tuned_workers))
-    val_workers = max(0, min(nw, max(1, tuned_workers // 2)))
+    val_workers = 0  # 验证阶段强制 0 以节省内存
     train_loader = DataLoader(
         patch_train_dataset,
         batch_size=batch_size,
@@ -335,7 +409,7 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
         num_workers=train_workers,
         pin_memory=pin_mem,
         persistent_workers=persistent,
-        prefetch_factor=prefetch if train_workers > 0 else None
+        prefetch_factor=1 if train_workers > 0 else None
     )
     val_loader = DataLoader(
         patch_val_dataset,
@@ -345,9 +419,38 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
         num_workers=val_workers,
         pin_memory=pin_mem,
         persistent_workers=persistent,
-        prefetch_factor=prefetch if val_workers > 0 else None
+        prefetch_factor=1 if val_workers > 0 else None
     )
     
+    # ===== 续训：尝试加载已有 checkpoint =====
+    resume_ckpt_path = None
+    completed_relabel_iters = 0
+
+    if resume is not None:
+        if str(resume).lower() == 'auto':
+            # 优先从最新的 relabel_iterK 恢复，其次从预训练最优恢复
+            relabel_ckpt, completed = _find_latest_relabel_ckpt(output_dir)
+            if relabel_ckpt is not None:
+                resume_ckpt_path = relabel_ckpt
+                completed_relabel_iters = int(completed)
+            else:
+                pre_ckpt = os.path.join(output_dir, 'pretrain_best.pth')
+                if os.path.exists(pre_ckpt):
+                    resume_ckpt_path = pre_ckpt
+                    completed_relabel_iters = 0
+        else:
+            # 指定文件路径
+            if os.path.exists(resume):
+                resume_ckpt_path = resume
+            else:
+                raise FileNotFoundError(f"resume checkpoint not found: {resume}")
+
+    if resume_ckpt_path is not None:
+        _load_model_weights(model, resume_ckpt_path, device)
+        print(f"[RESUME] 已加载权重: {resume_ckpt_path}")
+    else:
+        print("[RESUME] 未启用/未发现可用checkpoint，将从头开始预训练")
+
     # 预训练
     lr_main = float(cfg['train'].get('lr', 1e-4))
     wd_main = float(cfg['train'].get('weight_decay', 1e-5))
@@ -355,25 +458,30 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     use_amp = bool(cfg['train'].get('amp', True)) and (device.type == 'cuda')
     pretrain_epochs = cfg['train'].get('pretrain_epochs', 20)
     best_auc = 0.0
-    
-    for epoch in range(pretrain_epochs):
-        print(f"\n  预训练 Epoch {epoch+1}/{pretrain_epochs}")
-        train_loss = train_epoch(model, train_loader, opt, device, cfg)
-        metrics, val_loss = evaluate(model, val_loader, device, cfg)
-        
-        print(f"    训练损失: {train_loss:.4f}, 验证损失: {val_loss:.4f}")
-        print(f"    验证 AUC: {metrics['auc']:.4f}, ACC: {metrics['acc']:.4f}")
-        
-        if metrics['auc'] > best_auc:
-            best_auc = metrics['auc']
-            ckpt_path = os.path.join(output_dir, 'pretrain_best.pth')
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"    → 保存最佳模型: {ckpt_path}")
-    
-    # 加载最佳预训练模型
-    best_ckpt = os.path.join(output_dir, 'pretrain_best.pth')
-    model.load_state_dict(torch.load(best_ckpt, map_location=device))
-    print(f"\n  加载最佳预训练模型: {best_ckpt}")
+
+    if resume_ckpt_path is None:
+        # 从头预训练
+        for epoch in range(pretrain_epochs):
+            print(f"\n  预训练 Epoch {epoch+1}/{pretrain_epochs}")
+            train_loss = train_epoch(model, train_loader, opt, device, cfg)
+            metrics, val_loss = evaluate(model, val_loader, device, cfg)
+
+            print(f"    训练损失: {train_loss:.4f}, 验证损失: {val_loss:.4f}")
+            print(f"    验证 AUC: {metrics['auc']:.4f}, ACC: {metrics['acc']:.4f}")
+
+            if metrics['auc'] > best_auc:
+                best_auc = metrics['auc']
+                ckpt_path = os.path.join(output_dir, 'pretrain_best.pth')
+            # 处理 DataParallel 包装
+            state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save(state_dict, ckpt_path)
+        best_ckpt = os.path.join(output_dir, 'pretrain_best.pth')
+        if os.path.exists(best_ckpt):
+            _load_model_weights(model, best_ckpt, device)
+            print(f"\n  加载最佳预训练模型: {best_ckpt}")
+    else:
+        # 已从 relabel_iterK.pth 加载，跳过预训练阶段
+        print("[RESUME] 检测到已完成预训练，跳过 Stage 2")
     
     # =====================
     # 3. 迭代重标阶段
@@ -382,11 +490,18 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     high_conf_threshold = cfg['train'].get('high_conf_threshold', 0.8)
     low_conf_threshold = cfg['train'].get('low_conf_threshold', 0.2)
     
-    for iter_idx in range(n_iters):
+    patch_train_dataset_refined = None
+    train_loader_refined = None
+
+    start_iter = int(completed_relabel_iters)
+    if start_iter > 0:
+        print(f"[RESUME] 已完成迭代重标轮次: {start_iter}/{n_iters}，将从第 {start_iter+1} 轮继续")
+
+    for iter_idx in range(start_iter, n_iters):
         print(f"\n[Stage 3.{iter_idx+1}] 迭代重标 - 轮次 {iter_idx+1}/{n_iters}")
         
         # 推理获得patch分数
-        patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size)
+        patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers)
         
         # 重标高置信patch
         refined_labels, stats = relabel_patches(
@@ -416,7 +531,7 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
             num_workers=train_workers,
             pin_memory=pin_mem,
             persistent_workers=persistent,
-            prefetch_factor=prefetch if train_workers > 0 else None
+            prefetch_factor=1 if train_workers > 0 else None
         )
         
         # 微调
@@ -439,8 +554,37 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
         
         # 保存迭代检查点
         ckpt_path = os.path.join(output_dir, f'relabel_iter{iter_idx+1}.pth')
-        torch.save(model.state_dict(), ckpt_path)
+        state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        torch.save(state_dict, ckpt_path)
         print(f"  保存检查点: {ckpt_path}")
+
+    # 如果 Stage 3 被完全跳过(例如 n_iters=0 或 resume 到 n_iters), 仍需构建 refined 数据集供 Stage 4 使用
+    if patch_train_dataset_refined is None:
+        print("\n[Stage 3] 未执行迭代重标循环，重算一次 refined labels 以进入 Stage 4...")
+        patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers)
+        refined_labels, stats = relabel_patches(
+            patch_scores,
+            high_conf_threshold=high_conf_threshold,
+            low_conf_threshold=low_conf_threshold
+        )
+        print(f"  重标统计(补算): 高置信正样本={stats['high_conf_pos']}, 高置信负样本={stats['high_conf_neg']}, 总重标={stats['total_relabeled']}")
+        patch_train_dataset_refined = PatchDataset(
+            base_dataset=train_dataset,
+            patch_size=patch_size,
+            stride=stride,
+            patch_labels=refined_labels,
+            mode='finetune'
+        )
+        train_loader_refined = DataLoader(
+            patch_train_dataset_refined,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_patch_batch,
+            num_workers=train_workers,
+            pin_memory=pin_mem,
+            persistent_workers=persistent,
+            prefetch_factor=1 if train_workers > 0 else None
+        )
     
     # =====================
     # 4. 分阶段微调阶段
@@ -449,7 +593,10 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     
     # 阶段1: 冻结骨干,微调分类头
     print("\n  阶段4.1: 冻结骨干,微调分类头...")
-    model.freeze_backbone()
+    if isinstance(model, nn.DataParallel):
+        model.module.freeze_backbone()
+    else:
+        model.freeze_backbone()
     
     lr_head = float(cfg['train'].get('lr', 1e-4))
     wd_head = float(cfg['train'].get('weight_decay', 1e-5))
@@ -467,7 +614,10 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
     
     # 阶段2: 解冻骨干,联合微调
     print("\n  阶段4.2: 解冻骨干,联合微调...")
-    model.unfreeze_backbone()
+    if isinstance(model, nn.DataParallel):
+        model.module.unfreeze_backbone()
+    else:
+        model.unfreeze_backbone()
     
     lr_full = float(cfg['train'].get('lr', 1e-4)) * 0.1
     wd_full = float(cfg['train'].get('weight_decay', 1e-5))
@@ -490,7 +640,8 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil'):
         if metrics['auc'] > best_final_auc:
             best_final_auc = metrics['auc']
             ckpt_path = os.path.join(output_dir, 'final_best.pth')
-            torch.save(model.state_dict(), ckpt_path)
+            state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+            torch.save(state_dict, ckpt_path)
     
     print(f"\n[INFO] 训练完成! 最佳模型: {output_dir}/final_best.pth")
     
@@ -518,6 +669,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str, default='config.yaml', help='配置文件路径')
     parser.add_argument('--out_dir', type=str, default='outputs/patch_mil', help='输出目录')
     parser.add_argument('--synthetic', action='store_true', help='使用合成数据进行测试')
+    parser.add_argument('--resume', type=str, default=None, help="续训: auto 或 checkpoint 路径")
     
     args = parser.parse_args()
     
@@ -528,4 +680,4 @@ if __name__ == '__main__':
         cfg['data']['train_csv'] = None
         cfg['data']['val_csv'] = None
     
-    train_patch_mil(cfg, output_dir=args.out_dir)
+    train_patch_mil(cfg, output_dir=args.out_dir, resume=args.resume)

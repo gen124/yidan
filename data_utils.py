@@ -30,6 +30,7 @@ class PDVolDataset(Dataset):
         self.input_size = input_size
         self.transform = transform or {}
         self.synthetic = synthetic
+        self.cache = {} # 内存缓存，加速 PatchDataset 的重复访问
         if self.synthetic:
             for i in range(40 if mode=='train' else 10):
                 # synthetic entries include an aal field (third channel) -- PDVolDataset will populate
@@ -73,61 +74,41 @@ class PDVolDataset(Dataset):
         return a[sd:ed, sh:eh, sw:ew]
 
     def __getitem__(self, idx):
-        rec = self.items[idx]
-        if self.synthetic:
-            D,H,W = self.input_size[2], self.input_size[0], self.input_size[1]
-            qsm = np.random.randn(D,H,W).astype(np.float32)
-            t1  = np.random.randn(D,H,W).astype(np.float32)
-            # synthetic ROI map: zeros (no ROI)
-            aal = np.zeros((D,H,W), dtype=np.float32)
-            label = rec['label']
-            pid = rec['id']
+        if idx in self.cache:
+            vol, aal, label, pid = self.cache[idx]
         else:
-            qsm = load_nifti_arr(rec['qsm'])
-            # t1/aal 允许缺失：若路径为空或不存在则用全零
-            t1  = load_nifti_arr(rec['t1']) if (rec['t1'] is not None and os.path.exists(rec['t1'])) else np.zeros_like(qsm, dtype=np.float32)
-            aal = load_nifti_arr(rec['aal']) if (rec['aal'] is not None and os.path.exists(rec['aal'])) else None
-            qsm = self.center_crop_or_pad(qsm, self.input_size)
-            t1  = self.center_crop_or_pad(t1, self.input_size)
-            if aal is not None:
-                aal = self.center_crop_or_pad(aal, self.input_size)
-            label = rec['label']; pid = rec['id']
-        qsm = zscore_normalize(qsm, mask=(aal>0) if aal is not None else None)
-        t1  = zscore_normalize(t1, mask=(aal>0) if aal is not None else None)
-        # ROI segmentation map should not be z-scored - keep labels / mask values as float channel
-        if aal is None:
-            aal_chan = np.zeros_like(qsm, dtype=np.float32)
-        else:
-            aal_chan = aal.astype(np.float32)
-        vol = np.stack([qsm, t1, aal_chan], axis=0)
+            rec = self.items[idx]
+            if self.synthetic:
+                D,H,W = self.input_size[2], self.input_size[0], self.input_size[1]
+                qsm = np.random.randn(D,H,W).astype(np.float32)
+                t1  = np.random.randn(D,H,W).astype(np.float32)
+                # synthetic ROI map: zeros (no ROI)
+                aal = np.zeros((D,H,W), dtype=np.float32)
+                label = rec['label']
+                pid = rec['id']
+            else:
+                qsm = load_nifti_arr(rec['qsm'])
+                # t1/aal 允许缺失：若路径为空或不存在则用全零
+                t1  = load_nifti_arr(rec['t1']) if (rec['t1'] is not None and os.path.exists(rec['t1'])) else np.zeros_like(qsm, dtype=np.float32)
+                aal = load_nifti_arr(rec['aal']) if (rec['aal'] is not None and os.path.exists(rec['aal'])) else None
+                qsm = self.center_crop_or_pad(qsm, self.input_size)
+                t1  = self.center_crop_or_pad(t1, self.input_size)
+                if aal is not None:
+                    aal = self.center_crop_or_pad(aal, self.input_size)
+                label = rec['label']; pid = rec['id']
+            qsm = zscore_normalize(qsm, mask=(aal>0) if aal is not None else None)
+            t1  = zscore_normalize(t1, mask=(aal>0) if aal is not None else None)
+            # ROI segmentation map should not be z-scored - keep labels / mask values as float channel
+            if aal is None:
+                aal_chan = np.zeros_like(qsm, dtype=np.float32)
+            else:
+                aal_chan = aal.astype(np.float32)
+            vol = np.stack([qsm, t1, aal_chan], axis=0)
+            vol_t = torch.from_numpy(vol).float()
+            # 存入缓存 (不含随机增强)
+            self.cache[idx] = (vol_t, aal, label, pid)
 
-        # light-weight augmentations targeted for small-sample regimes
-        if self.transform.get('flip', False) and random.random() < 0.5:
-            # apply random flips across any subset of axes for both image channels and segmentation
-            axes = []
-            if random.random() < 0.5: axes.append(2)  # depthå
-            if random.random() < 0.5: axes.append(1)  # height
-            if random.random() < 0.5: axes.append(0)  # width
-            if len(axes) > 0:
-                vol = np.flip(vol, axis=[a+1 for a in axes])  # +1 because vol channel is axis 0
-                vol = vol.copy()
-        # additional augmentations
-        # intensity noise
-        noise_sigma = float(self.transform.get('noise_sigma', 0.0))
-        if noise_sigma > 0:
-            vol[:2] = vol[:2] + np.random.randn(*vol[:2].shape).astype(np.float32) * noise_sigma
-            vol = vol.copy()
-        # intensity scaling / shift (per-channel) - helps small-sample robustness
-        if self.transform.get('intensity_scale', False) and random.random() < 0.5:
-            scale = float(self.transform.get('intensity_scale_range', 0.1))
-            mult = 1.0 + np.random.uniform(-scale, scale)
-            vol[:2] = vol[:2] * mult
-            vol = vol.copy()
-        # random 90-degree rotations in the HxW plane (keeps depth axis intact)
-        if self.transform.get('rotate90', False) and random.random() < float(self.transform.get('rotate90_prob', 0.3)):
-            # vol shape is (C, D, H, W); rotate within HxW plane (axes 2 and 3)
-            vol = np.rot90(vol, k=random.choice([1,2,3]), axes=(2,3)).copy()
-        vol_t = torch.tensor(vol, dtype=torch.float32)
+        vol_t, aal, label, pid = self.cache[idx]
         sample = {'volume': vol_t, 'aal': aal, 'label': int(label), 'id': pid}
         return sample
 
@@ -143,7 +124,7 @@ class PatchDataset(Dataset):
     1. 预训练阶段: 每个3D样本按patch_grid拆成多个patch,所有patch继承患者标签
     2. 迭代重标阶段: 根据模型预测分数更新patch标签(高置信patch重新标注)
     """
-    def __init__(self, base_dataset, patch_size=(48,48,32), stride=None, patch_labels=None, mode='pretrain'):
+    def __init__(self, base_dataset, patch_size=(48,48,32), stride=None, patch_labels=None, mode='pretrain', transform=None):
         """
         Args:
             base_dataset: PDVolDataset实例,提供完整的3D体积
@@ -151,12 +132,14 @@ class PatchDataset(Dataset):
             stride: 滑动窗口步长,默认=patch_size(无重叠)
             patch_labels: dict {(patient_id, patch_idx): refined_label} 用于迭代重标阶段
             mode: 'pretrain' (用患者标签) 或 'finetune' (用refined标签)
+            transform: 增强配置
         """
         self.base_dataset = base_dataset
         self.patch_size = patch_size
         self.stride = stride if stride else patch_size
         self.patch_labels = patch_labels or {}
         self.mode = mode
+        self.transform = transform or {}
         
         # 预计算所有patch的索引: (patient_idx, patch_coords, patient_label)
         self.patch_index = []
@@ -221,6 +204,31 @@ class PatchDataset(Dataset):
         h_s, w_s, d_s, ph, pw, pd = coords
         patch = vol[:, d_s:d_s+pd, h_s:h_s+ph, w_s:w_s+pw]  # (C, pd, ph, pw)
         
+        # 在 Patch 级别进行增强，计算量极小
+        if self.transform:
+            patch_np = patch.numpy()
+            if self.transform.get('flip', False) and random.random() < 0.5:
+                axes = []
+                if random.random() < 0.5: axes.append(1) # depth
+                if random.random() < 0.5: axes.append(2) # height
+                if random.random() < 0.5: axes.append(3) # width
+                if axes:
+                    patch_np = np.flip(patch_np, axis=axes).copy()
+            
+            noise_sigma = float(self.transform.get('noise_sigma', 0.0))
+            if noise_sigma > 0:
+                patch_np[:2] += np.random.randn(*patch_np[:2].shape).astype(np.float32) * noise_sigma
+            
+            if self.transform.get('intensity_scale', False) and random.random() < 0.5:
+                scale = float(self.transform.get('intensity_scale_range', 0.1))
+                mult = 1.0 + np.random.uniform(-scale, scale)
+                patch_np[:2] *= mult
+            
+            if self.transform.get('rotate90', False) and random.random() < float(self.transform.get('rotate90_prob', 0.3)):
+                patch_np = np.rot90(patch_np, k=random.choice([1,2,3]), axes=(2,3)).copy()
+            
+            patch = torch.from_numpy(patch_np)
+
         return {
             'volume': patch,
             'label': label,
