@@ -26,8 +26,14 @@ def eval_patient_level(exp_dir='outputs/exp2', config_path='config.yaml'):
     model = build_patch_model(cfg).to(device)
     ckpt_path = os.path.join(exp_dir, 'final_best.pth')
     if not os.path.exists(ckpt_path):
-        print(f"[ERROR] 找不到模型文件: {ckpt_path}")
-        return
+        # 尝试回退到默认 exp4 的模型（常见情况：stage5 只训练 aggregator，classifier 保存在原 exp4）
+        fallback = os.path.join('outputs', 'exp4', 'final_best.pth')
+        if os.path.exists(fallback):
+            print(f"[WARN] 在 {ckpt_path} 找不到模型，尝试回退到 {fallback}")
+            ckpt_path = fallback
+        else:
+            print(f"[ERROR] 找不到模型文件: {ckpt_path}")
+            return
     
     ckpt = torch.load(ckpt_path, map_location=device)
     # 处理 DataParallel 包装
@@ -59,6 +65,10 @@ def eval_patient_level(exp_dir='outputs/exp2', config_path='config.yaml'):
     loader = DataLoader(patch_val_dataset, batch_size=64, shuffle=False, num_workers=4)
     
     pooling_type = cfg['train'].get('pooling', 'topk_mean')
+    # 如果实验目录包含训练好的 aggregator（stage5），优先使用 attention 聚合
+    if pooling_type != 'attention' and os.path.exists(os.path.join(exp_dir, 'aggregator_best.pth')):
+        print(f"[INFO] aggregator_best.pth 存在，强制使用 pooling=attention")
+        pooling_type = 'attention'
     need_features = (pooling_type == 'attention')
 
     with torch.no_grad():
@@ -95,6 +105,18 @@ def eval_patient_level(exp_dir='outputs/exp2', config_path='config.yaml'):
         pooling=pooling_type,
         topk_percent=cfg['train'].get('topk_percent', 0.15)
     ).to(device)
+    # 如果有训练好的 aggregator 权重（stage5 attention），尝试加载
+    agg_ckpt_path = os.path.join(exp_dir, 'aggregator_best.pth')
+    if pooling_type == 'attention' and os.path.exists(agg_ckpt_path):
+        try:
+            agg_ckpt = torch.load(agg_ckpt_path, map_location=device)
+            # 处理 DataParallel 包装
+            if all(k.startswith('module.') for k in agg_ckpt.keys()):
+                agg_ckpt = {k.replace('module.', ''): v for k, v in agg_ckpt.items()}
+            aggregator.load_state_dict(agg_ckpt)
+            print(f"[INFO] Loaded aggregator weights from {agg_ckpt_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to load aggregator weights: {e}")
     
     # 如果是 attention，需要加载 aggregator 的权重 (如果有的话)
     # 注意：在当前代码中，attn_fc 是在 ResNet3D_PatchClassifier 之外的？
@@ -118,27 +140,25 @@ def eval_patient_level(exp_dir='outputs/exp2', config_path='config.yaml'):
         y_prob.append(prob)
 
     # 6. 计算指标
+    from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
     y_true = np.array(y_true)
     y_prob = np.array(y_prob)
     
     # 计算 ROC 曲线
     fpr, tpr, thresholds = roc_curve(y_true, y_prob)
-    
     # 寻找最佳阈值 (Youden's Index: J = TPR - FPR)
     j_scores = tpr - fpr
     best_idx = np.argmax(j_scores)
     best_threshold = thresholds[best_idx]
-    
-    # 使用默认阈值 0.5 的结果
-    y_pred_05 = (y_prob >= 0.5).astype(int)
-    acc_05 = accuracy_score(y_true, y_pred_05)
-    
     # 使用最佳阈值的结果
     y_pred_best = (y_prob >= best_threshold).astype(int)
     acc_best = accuracy_score(y_true, y_pred_best)
-    
+    pre_best = precision_score(y_true, y_pred_best)
+    sen_best = recall_score(y_true, y_pred_best)
+    f1_best = f1_score(y_true, y_pred_best)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred_best).ravel()
+    spe_best = tn / (tn + fp) if (tn + fp) > 0 else 0.0
     auc = roc_auc_score(y_true, y_prob)
-    
     print("\n" + "="*30)
     print(f"患者级评估结果 ({exp_dir})")
     print(f"聚合方式: {pooling_type}")
@@ -146,9 +166,12 @@ def eval_patient_level(exp_dir='outputs/exp2', config_path='config.yaml'):
     print(f"正样本数: {sum(y_true)}")
     print(f"负样本数: {len(y_true) - sum(y_true)}")
     print("-" * 30)
-    print(f"患者级 AUC: {auc:.4f}")
-    print(f"默认阈值 (0.5) ACC: {acc_05:.4f}")
-    print(f"最佳阈值 ({best_threshold:.4f}) ACC: {acc_best:.4f}")
+    print(f"AUC: {auc:.4f}")
+    print(f"ACC: {acc_best:.4f}")
+    print(f"SEN: {sen_best:.4f}")
+    print(f"PRE: {pre_best:.4f}")
+    print(f"F1-score: {f1_best:.4f}")
+    print(f"SPE: {spe_best:.4f}")
     print("="*30)
 
 if __name__ == '__main__':

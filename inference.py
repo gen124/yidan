@@ -11,6 +11,22 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 import yaml
 
+
+def center_crop_or_pad(arr, out_shape):
+    """Center-crop or pad a 3D array `arr` to `out_shape`."""
+    a = arr
+    D, H, W = a.shape
+    od, oh, ow = out_shape
+    pad_d = max(0, od - D); pad_h = max(0, oh - H); pad_w = max(0, ow - W)
+    pad = ((pad_d//2, pad_d - pad_d//2), (pad_h//2, pad_h - pad_h//2), (pad_w//2, pad_w - pad_w//2))
+    if any(p>0 for pair in pad for p in pair):
+        a = np.pad(a, pad, mode='constant', constant_values=0)
+    D2, H2, W2 = a.shape
+    sd = (D2 - od)//2; ed = sd + od
+    sh = (H2 - oh)//2; eh = sh + oh
+    sw = (W2 - ow)//2; ew = sw + ow
+    return a[sd:ed, sh:eh, sw:ew]
+
 def load_cfg(path='config.yaml'):
     with open(path,'r') as f: return yaml.safe_load(f)
 
@@ -88,21 +104,12 @@ def run_inference_and_explain(model_ckpt, qsm_path, t1_path, aal_path=None, cfg_
             aal = load_nifti_arr(aal_path)
         # if shapes mismatch, center-crop or pad aal to match qsm
         if aal.shape != qsm.shape:
-            def center_crop_or_pad(arr, out_shape):
-                a = arr
-                D, H, W = a.shape
-                od, oh, ow = out_shape
-                pad_d = max(0, od - D); pad_h = max(0, oh - H); pad_w = max(0, ow - W)
-                pad = ((pad_d//2, pad_d - pad_d//2), (pad_h//2, pad_h - pad_h//2), (pad_w//2, pad_w - pad_w//2))
-                if any(p>0 for pair in pad for p in pair):
-                    a = np.pad(a, pad, mode='constant', constant_values=0)
-                D2, H2, W2 = a.shape
-                sd = (D2 - od)//2; ed = sd + od
-                sh = (H2 - oh)//2; eh = sh + oh
-                sw = (W2 - ow)//2; ew = sw + ow
-                return a[sd:ed, sh:eh, sw:ew]
             aal = center_crop_or_pad(aal, qsm.shape)
         aal_n = aal.astype(np.float32)
+        # ensure t1 aligns to qsm
+        if t1.shape != qsm.shape:
+            t1 = center_crop_or_pad(t1, qsm.shape)
+            t1_n = zscore_normalize(t1)
     else:
         aal_n = np.zeros_like(qsm, dtype=np.float32)
     # stack three channels: QSM, T1, and ROI segmentation map

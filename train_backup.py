@@ -22,7 +22,6 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim import Adam
 from tqdm import tqdm
@@ -32,9 +31,7 @@ import math
 import os
 import re
 
-from sklearn.metrics import roc_auc_score
-
-from data_utils import PDVolDataset, PatchDataset, BagDataset
+from data_utils import PDVolDataset, PatchDataset
 from models_patch import ResNet3D_PatchClassifier, PatchMILAggregator, build_patch_model
 from metrics import compute_metrics
 
@@ -81,51 +78,6 @@ def _safe_bool(v, default=False):
     except Exception:
         return default
 
-
-class FocalLoss(nn.Module):
-    """Binary focal loss for logits.
-
-    Args:
-        alpha (float): weight for positive class. If None, set 0.5.
-        gamma (float): focusing parameter.
-        reduction (str): 'mean'|'sum'|'none'
-    """
-    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha if alpha is not None else 0.5
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        # logits: Tensor of shape (N,1) or (N,) ; targets: same shape
-        probs = torch.sigmoid(logits)
-        targets = targets.type_as(probs)
-        ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        alpha_factor = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        modulating_factor = (1.0 - p_t) ** self.gamma
-        loss = alpha_factor * modulating_factor * ce_loss
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
-
-
-def get_loss_fn(cfg):
-    """Return a loss function according to cfg['train']['loss']
-
-    Supported: 'bce' (default), 'focal'
-    """
-    loss_name = str(cfg['train'].get('loss', 'bce')).lower()
-    if loss_name == 'focal':
-        alpha = float(cfg['train'].get('focal_alpha', 0.25))
-        gamma = float(cfg['train'].get('focal_gamma', 2.0))
-        return FocalLoss(alpha=alpha, gamma=gamma, reduction='mean')
-    else:
-        return nn.BCEWithLogitsLoss()
-
 def auto_tune_batch_and_workers(model, dataset, device, cfg):
     """
     基于一次试跑估计每样本显存占用, 动态放大 batch_size 直到接近目标显存占用,
@@ -138,7 +90,7 @@ def auto_tune_batch_and_workers(model, dataset, device, cfg):
     # 估计每样本显存占用
     est_per_sample = None
     test_bs = min(bs_cfg, 8) # 只需要很小的 batch 就能估计显存
-    loss_fn = get_loss_fn(cfg)
+    loss_fn = nn.BCEWithLogitsLoss()
     non_blocking = _safe_bool(cfg['train'].get('pin_memory', True)) and (device.type == 'cuda')
 
     if device.type == 'cuda':
@@ -221,7 +173,7 @@ def train_epoch(model, loader, opt, device, cfg):
     model.train()
     total_loss = 0.0
     n_batches = 0
-    loss_fn = get_loss_fn(cfg)
+    loss_fn = nn.BCEWithLogitsLoss()
     use_amp = bool(cfg['train'].get('amp', True)) and (device.type == 'cuda')
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     non_blocking = bool(cfg['train'].get('pin_memory', True)) and (device.type == 'cuda')
@@ -254,7 +206,7 @@ def evaluate(model, loader, device, cfg):
     model.eval()
     all_preds = []
     all_labels = []
-    loss_fn = get_loss_fn(cfg)
+    loss_fn = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     n_batches = 0
     use_amp = bool(cfg['train'].get('amp', True)) and (device.type == 'cuda')
@@ -712,6 +664,32 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
     print(f"[INFO] 元数据已保存: {metadata_path}")
 
 
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Patch级迭代重标训练')
+    parser.add_argument('--config', type=str, default='config.yaml', help='配置文件路径')
+    parser.add_argument('--out_dir', type=str, default='outputs/patch_mil', help='输出目录')
+    parser.add_argument('--synthetic', action='store_true', help='使用合成数据进行测试')
+    parser.add_argument('--resume', type=str, default=None, help="续训: auto 或 checkpoint 路径")
+    parser.add_argument('--stage5', action='store_true', help='仅运行 Stage 5 (Attention 微调)')
+    parser.add_argument('--base_model', type=str, default=None, help='Stage 5 所需的基础模型路径')
+    
+    args = parser.parse_args()
+    
+    cfg = load_cfg(args.config)
+    
+    # 如果指定了合成数据,则修改配置
+    if args.synthetic:
+        cfg['data']['train_csv'] = None
+        cfg['data']['val_csv'] = None
+    
+    if args.stage5:
+        if not args.base_model:
+            # 尝试自动寻找
+            args.base_model = os.path.join(args.out_dir, 'final_best.pth')
+        train_attention_stage(cfg, args.out_dir, args.base_model)
+    else:
+        train_patch_mil(cfg, output_dir=args.out_dir, resume=args.resume)
+
 def collate_bag_batch(batch):
     """Bag数据集的collate函数 (B=1)"""
     return {
@@ -755,7 +733,7 @@ def train_attention_stage(cfg, output_dir, base_model_path):
     val_loader = DataLoader(bag_val, batch_size=1, shuffle=False, collate_fn=collate_bag_batch, num_workers=0)
     
     opt = Adam(aggregator.parameters(), lr=float(cfg['train'].get('lr', 1e-4)))
-    loss_fn = get_loss_fn(cfg)
+    loss_fn = nn.BCEWithLogitsLoss()
     
     best_auc = 0.0
     epochs = cfg['train'].get('final_epochs', 10)
@@ -813,31 +791,3 @@ def train_attention_stage(cfg, output_dir, base_model_path):
             torch.save(aggregator.state_dict(), os.path.join(output_dir, 'aggregator_best.pth'))
             
     print(f"[INFO] Stage 5 完成! 最佳 Aggregator AUC: {best_auc:.4f}")
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Patch级迭代重标训练')
-    parser.add_argument('--config', type=str, default='config.yaml', help='配置文件路径')
-    parser.add_argument('--out_dir', type=str, default='outputs/patch_mil', help='输出目录')
-    parser.add_argument('--synthetic', action='store_true', help='使用合成数据进行测试')
-    parser.add_argument('--resume', type=str, default=None, help="续训: auto 或 checkpoint 路径")
-    parser.add_argument('--stage5', action='store_true', help='仅运行 Stage 5 (Attention 微调)')
-    parser.add_argument('--base_model', type=str, default=None, help='Stage 5 所需的基础模型路径')
-    
-    args = parser.parse_args()
-    
-    cfg = load_cfg(args.config)
-    
-    # 如果指定了合成数据,则修改配置
-    if args.synthetic:
-        cfg['data']['train_csv'] = None
-        cfg['data']['val_csv'] = None
-    
-    if args.stage5:
-        if not args.base_model:
-            # 尝试自动寻找
-            args.base_model = os.path.join(args.out_dir, 'final_best.pth')
-        train_attention_stage(cfg, args.out_dir, args.base_model)
-    else:
-        train_patch_mil(cfg, output_dir=args.out_dir, resume=args.resume)
-

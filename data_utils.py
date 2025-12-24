@@ -236,3 +236,64 @@ class PatchDataset(Dataset):
             'patch_idx': info['patch_idx'],
             'id': f"{info['patient_id']}_patch{info['patch_idx']}"
         }
+
+class BagDataset(Dataset):
+    """
+    袋级数据集: 每次返回一个患者的所有 patches (用于 Attention MIL 训练)
+    """
+    def __init__(self, base_dataset, patch_size=(48,48,32), stride=None):
+        self.base_dataset = base_dataset
+        self.patch_size = patch_size
+        self.stride = stride if stride else patch_size
+        
+        # 预计算每个患者的 patch 坐标
+        self.patient_patches = []
+        for pt_idx in range(len(base_dataset)):
+            sample = base_dataset[pt_idx]
+            vol = sample['volume']
+            patient_id = sample['id']
+            label = sample['label']
+            
+            C, D, H, W = vol.shape
+            ph, pw, pd = self.patch_size
+            sh, sw, sd = self.stride
+            
+            n_h = max(1, (H - ph) // sh + 1)
+            n_w = max(1, (W - pw) // sw + 1)
+            n_d = max(1, (D - pd) // sd + 1)
+            
+            coords_list = []
+            for i in range(n_h):
+                for j in range(n_w):
+                    for k in range(n_d):
+                        h_start, w_start, d_start = i*sh, j*sw, k*sd
+                        if h_start + ph > H or w_start + pw > W or d_start + pd > D:
+                            continue
+                        coords_list.append((h_start, w_start, d_start, ph, pw, pd))
+            
+            self.patient_patches.append({
+                'pt_idx': pt_idx,
+                'patient_id': patient_id,
+                'label': label,
+                'coords': coords_list
+            })
+
+    def __len__(self):
+        return len(self.patient_patches)
+
+    def __getitem__(self, idx):
+        info = self.patient_patches[idx]
+        sample = self.base_dataset[info['pt_idx']]
+        vol = sample['volume']
+        
+        patches = []
+        for c in info['coords']:
+            h_s, w_s, d_s, ph, pw, pd = c
+            p = vol[:, d_s:d_s+pd, h_s:h_s+ph, w_s:w_s+pw]
+            patches.append(p)
+        
+        return {
+            'patches': torch.stack(patches, dim=0), # (N, C, D, H, W)
+            'label': info['label'],
+            'patient_id': info['patient_id']
+        }

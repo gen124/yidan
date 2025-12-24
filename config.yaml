@@ -35,22 +35,26 @@ train:
   # ====== Patch级训练参数 ======
   # 原始体积切patch的大小
   patch_size: [48, 48, 32]      # [H, W, D]
-  patch_stride: [48, 48, 32]    # 无重叠时等于patch_size; 可设更小的值产生重叠patch
+  patch_stride: [24, 24, 16]    # 无重叠时等于patch_size; 可设更小的值产生重叠patch
   pooling: topk_mean            # patch级聚合方式: topk_mean | max | attention(需非重叠,会返回特征)
-  topk_percent: 0.1            # topk_mean比例/attention默认保留
+  topk_percent: 0.15            # topk_mean比例/attention默认保留
   
   # 预训练阶段
   pretrain_epochs: 20
   
   # 迭代重标参数
-  n_relabel_iters: 6            # 迭代轮次
+  n_relabel_iters: 4            # 迭代轮次
   high_conf_threshold: 0.8      # 高置信正样本阈值（收紧，减少伪正）
-  low_conf_threshold: 0.4       # 高置信负样本阈值（放宽，捕获负样本）
+  low_conf_threshold: 0.3       # 高置信负样本阈值（放宽，捕获负样本）
   
   # 微调参数
   finetune_epochs: 8            # 每轮迭代微调的epoch数
   head_finetune_epochs: 5       # 阶段1(冻结骨干)的epoch数
   final_epochs: 30              # 阶段2(联合训练)的epoch数
+  # 损失函数设置: 'bce' 或 'focal'
+  loss: bce
+  focal_alpha: 0.25
+  focal_gamma: 2.0
 explainer:
   supervoxel_n_segments: 200    # SLIC超体素数量
   topk_path: 3                   # 返回前3个重要路径
