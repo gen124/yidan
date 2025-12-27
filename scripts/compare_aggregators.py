@@ -39,7 +39,7 @@ def get_patient_probs(exp_dir, device, base_model_ckpt=None):
     loader = DataLoader(patch_val_dataset, batch_size=64, shuffle=False, num_workers=4)
 
     pooling_type = cfg['train'].get('pooling', 'topk_mean')
-    need_features = (pooling_type == 'attention')
+    need_features = pooling_type in ('attention', 'distribution', 'soft_topk', 'quantile')
 
     patient_results = {}
     with torch.no_grad():

@@ -36,21 +36,46 @@ train:
   # 原始体积切patch的大小
   patch_size: [48, 48, 32]      # [H, W, D]
   patch_stride: [24, 24, 16]    # 无重叠时等于patch_size; 可设更小的值产生重叠patch
-  pooling: topk_mean            # patch级聚合方式: topk_mean | max | attention(需非重叠,会返回特征)
+  # pooling: 聚合方式（建议使用 feature-based pooling）
+  # 可选值:
+  #  - distribution: 主结果，基于patch feature f_i的分布池化 -> concat(mean,var,max) -> Linear(3D->1)
+  #  - soft_topk:    消融1，使用 feature 的 L2 范数作为 score，权重 = softmax(score / tau)，用加权和(feature)再分类
+  #  - quantile:     消融2，按 score 的自适应分位数选择patch（score>=quantile），对这些patch的feature取均值再分类
+  #  - attention:    基于feature学习注意力权重（Bag-level训练专用）
+  #  - topk_mean/max/mean: 旧的 logit-based 聚合，向后兼容
+  pooling: distribution
   topk_percent: 0.15            # topk_mean比例/attention默认保留
+  # soft_topk 参数: tau 控制接近 hard-topk (tau 低) 或 平均 (tau 高)。建议试验值: 0.05, 0.1, 0.2
+  tau: 0.1
+  # quantile 参数: q 为分位数，quantile pooling 推荐使用第二种用法（选取 score>=quantile 的patch并平均它们的feature）
+  # 建议 q 在 [0.8,0.95] 之间，训练时可根据 patch_size 自适应调整
+  q: 0.9
+  # 自适应 quantile 控制参数: 当 patch_count 很小时，自动降低 q 以避免只选中过少的patch
+  q_min: 0.5        # q 的下界
+  q_ref_n: 100      # 参考 patch 数目 (当 N < q_ref_n 时按比例缩放 q)
+  # ====== 重标(relabel)相关，可选择用 feature-score 代替 patch logits ======
+  # 如果你想在迭代重标中使用 feature-derived score 而不是 logits, 请启用下面开关。
+  # 注意：推荐保留 logits 用于重标以保证稳定性；启用 feature-score 需谨慎并验证。
+  relabel_use_feature_score: false
+  # feature_score_type: 'l2' | 'mlp'
+  feature_score_type: l2
+  # 当 feature_score_type == 'mlp' 时，可指定一个已训练的 mlp checkpoint 路径
+  feature_score_mlp_ckpt: null
+  # mlp 结构 (仅用于加载/验证): hidden dims, activation 可按需调整
+  feature_score_mlp_hidden: 64
   
   # 预训练阶段
   pretrain_epochs: 20
   
   # 迭代重标参数
-  n_relabel_iters: 4            # 迭代轮次
+  n_relabel_iters: 2            # 迭代轮次
   high_conf_threshold: 0.8      # 高置信正样本阈值（收紧，减少伪正）
   low_conf_threshold: 0.3       # 高置信负样本阈值（放宽，捕获负样本）
   
   # 微调参数
   finetune_epochs: 8            # 每轮迭代微调的epoch数
   head_finetune_epochs: 5       # 阶段1(冻结骨干)的epoch数
-  final_epochs: 30              # 阶段2(联合训练)的epoch数
+  final_epochs: 20              # 阶段2(联合训练)的epoch数
   # 损失函数设置: 'bce' 或 'focal'
   loss: bce
   focal_alpha: 0.25

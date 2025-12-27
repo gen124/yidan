@@ -286,7 +286,7 @@ def evaluate(model, loader, device, cfg):
     return metrics, avg_loss
 
 
-def infer_patch_scores(model, dataset, device, batch_size=16, num_workers=0):
+def infer_patch_scores(model, dataset, device, batch_size=16, num_workers=0, cfg=None):
     """
     对所有patch进行推理,获取预测分数
     
@@ -304,16 +304,53 @@ def infer_patch_scores(model, dataset, device, batch_size=16, num_workers=0):
     )
     
     patch_scores = {}
-    
+
+    # decide whether to use feature-derived score for relabeling (default: use logits)
+    use_feature_score = False
+    feature_score_type = 'l2'
+    mlp_ckpt = None
+    mlp_hidden = None
+    if cfg is not None:
+        use_feature_score = bool(cfg['train'].get('relabel_use_feature_score', False))
+        feature_score_type = cfg['train'].get('feature_score_type', 'l2')
+        mlp_ckpt = cfg['train'].get('feature_score_mlp_ckpt', None)
+        mlp_hidden = cfg['train'].get('feature_score_mlp_hidden', None)
+
+    # if using mlp as score and ckpt provided, build small mlp
+    mlp = None
+    if use_feature_score and feature_score_type == 'mlp':
+        if mlp_ckpt is None:
+            print('[WARN] feature_score_type=mlp but feature_score_mlp_ckpt not provided; falling back to l2')
+            use_feature_score = True
+            feature_score_type = 'l2'
+        else:
+            # build small MLP: feat_dim -> hidden -> 1
+            # We'll infer feat_dim on the fly from first batch
+            mlp = None
+
     with torch.no_grad():
         for batch in tqdm(loader, desc='Inferring patch scores'):
             x = batch['volume'].to(device)
             with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
-                logits = model(x)
-            probs = torch.sigmoid(logits).cpu().numpy()
-            
-            for i, (pid, pidx) in enumerate(zip(batch['patient_id'], batch['patch_idx'])):
-                patch_scores[(pid, pidx)] = float(probs[i])
+                if use_feature_score:
+                    logits, features = model(x, return_features=True)
+                else:
+                    logits = model(x)
+
+            if use_feature_score:
+                # features: (B, D)
+                feats = features.cpu()
+                if feature_score_type == 'l2':
+                    scores = feats.norm(p=2, dim=1).numpy()
+                else:
+                    # mlp unsupported fallback: use l2
+                    scores = feats.norm(p=2, dim=1).numpy()
+                for i, (pid, pidx) in enumerate(zip(batch['patient_id'], batch['patch_idx'])):
+                    patch_scores[(pid, pidx)] = float(scores[i])
+            else:
+                probs = torch.sigmoid(logits).cpu().numpy()
+                for i, (pid, pidx) in enumerate(zip(batch['patient_id'], batch['patch_idx'])):
+                    patch_scores[(pid, pidx)] = float(probs[i])
     
     return patch_scores
 
@@ -376,19 +413,21 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
     # 1. 加载数据集
     # =====================
     print("\n[Stage 1] 加载数据集...")
+    # 如果配置中的 train_csv 为 None，认为是 synthetic 调试模式
+    use_synthetic = (cfg['data'].get('train_csv') is None)
     train_dataset = PDVolDataset(
         manifest_csv=cfg['data']['train_csv'],
         input_size=cfg['data']['input_size'],
         mode='train',
         transform=cfg['train'].get('augmentations', {}),
-        synthetic=False
+        synthetic=use_synthetic
     )
     val_dataset = PDVolDataset(
         manifest_csv=cfg['data']['val_csv'],
         input_size=cfg['data']['input_size'],
         mode='val',
         transform={},
-        synthetic=False
+        synthetic=use_synthetic
     )
     print(f"  训练集: {len(train_dataset)} 个3D体积")
     print(f"  验证集: {len(val_dataset)} 个3D体积")
@@ -549,7 +588,7 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
         print(f"\n[Stage 3.{iter_idx+1}] 迭代重标 - 轮次 {iter_idx+1}/{n_iters}")
         
         # 推理获得patch分数
-        patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers)
+        patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers, cfg=cfg)
         
         # 重标高置信patch
         refined_labels, stats = relabel_patches(
@@ -609,7 +648,7 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
     # 如果 Stage 3 被完全跳过(例如 n_iters=0 或 resume 到 n_iters), 仍需构建 refined 数据集供 Stage 4 使用
     if patch_train_dataset_refined is None:
         print("\n[Stage 3] 未执行迭代重标循环，重算一次 refined labels 以进入 Stage 4...")
-        patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers)
+        patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers, cfg=cfg)
         refined_labels, stats = relabel_patches(
             patch_scores,
             high_conf_threshold=high_conf_threshold,
@@ -741,7 +780,9 @@ def train_attention_stage(cfg, output_dir, base_model_path):
         _, feat = resnet(dummy_x, return_features=True)
         feat_dim = feat.shape[1]
     
-    aggregator = PatchMILAggregator(feat_dim=feat_dim, pooling='attention').to(device)
+    # use pooling type from config so we can train aggregator matching experiment setting
+    pooling_type = cfg['train'].get('pooling', 'attention')
+    aggregator = PatchMILAggregator(feat_dim=feat_dim, pooling=pooling_type).to(device)
     
     # 3. 准备数据
     train_dataset = PDVolDataset(cfg['data']['train_csv'], cfg['data']['input_size'], mode='train')
@@ -810,7 +851,8 @@ def train_attention_stage(cfg, output_dir, base_model_path):
         
         if auc > best_auc:
             best_auc = auc
-            torch.save(aggregator.state_dict(), os.path.join(output_dir, 'aggregator_best.pth'))
+            save_name = f"aggregator_{pooling_type}_best.pth"
+            torch.save(aggregator.state_dict(), os.path.join(output_dir, save_name))
             
     print(f"[INFO] Stage 5 完成! 最佳 Aggregator AUC: {best_auc:.4f}")
 

@@ -69,7 +69,6 @@ def eval_patient_level(exp_dir='outputs/exp2', config_path='config.yaml'):
     if pooling_type != 'attention' and os.path.exists(os.path.join(exp_dir, 'aggregator_best.pth')):
         print(f"[INFO] aggregator_best.pth 存在，强制使用 pooling=attention")
         pooling_type = 'attention'
-    # distribution/soft_topk/quantile/attention 都需要 patch features
     need_features = pooling_type in ('attention', 'distribution', 'soft_topk', 'quantile')
 
     with torch.no_grad():
