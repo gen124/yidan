@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_curve, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.calibration import calibration_curve
 import json
 import csv
 
@@ -25,6 +26,42 @@ if ROOT not in sys.path:
 
 from data_utils import PDVolDataset, PatchDataset
 from models_patch import build_patch_model, PatchMILAggregator
+
+
+# =========================
+# Calibration metrics (added for probabilistic evaluation)
+# =========================
+def compute_ece(y_true, y_prob, n_bins=10):
+    """Expected Calibration Error"""
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i + 1]
+        if i == n_bins - 1:
+            mask = (y_prob >= lo) & (y_prob <= hi)
+        else:
+            mask = (y_prob >= lo) & (y_prob < hi)
+
+        if np.any(mask):
+            acc = y_true[mask].mean()
+            conf = y_prob[mask].mean()
+            ece += np.abs(acc - conf) * mask.mean()
+
+    return float(ece)
+
+
+def compute_brier(y_true, y_prob):
+    """Brier Score"""
+    return float(np.mean((y_prob - y_true) ** 2))
+
+
+def compute_nll(y_true, y_prob, eps=1e-12):
+    """Negative Log Likelihood"""
+    y_prob = np.clip(y_prob, eps, 1 - eps)
+    return float(-np.mean(
+        y_true * np.log(y_prob) + (1 - y_true) * np.log(1 - y_prob)
+    ))
 
 
 def eval_distribution(exp_dir, config_path, batch_size=64, num_workers=4, limit=None):
@@ -165,10 +202,14 @@ def eval_distribution(exp_dir, config_path, batch_size=64, num_workers=4, limit=
     best_f1_thr = 0.5
     for thr in thr_grid:
         y_pred_thr = (y_prob >= thr).astype(int)
-        f1t = f1_score(y_true, y_pred_thr, zero_division=0)
-        if f1t > best_f1:
-            best_f1 = float(f1t)
-            best_f1_thr = float(thr)
+        try:
+            f1t = f1_score(y_true, y_pred_thr, zero_division=0)
+            if f1t > best_f1:
+                best_f1 = float(f1t)
+                best_f1_thr = float(thr)
+        except:
+            # Skip if f1 calculation fails (e.g., only one class)
+            continue
 
     # helper to compute per-threshold metrics
     def _metrics_at_threshold(threshold):
@@ -201,6 +242,13 @@ def eval_distribution(exp_dir, config_path, batch_size=64, num_workers=4, limit=
     auc = float(roc_auc_score(y_true, y_prob)) if len(np.unique(y_true)) > 1 else float('nan')
     brier = float(np.mean((y_prob - y_true) ** 2))
 
+    # Add probabilistic calibration metrics
+    ece = compute_ece(y_true, y_prob)
+    nll = compute_nll(y_true, y_prob)
+
+    # Calibration curve
+    prob_true, prob_pred = calibration_curve(y_true, y_prob, n_bins=10, strategy="uniform")
+
     out = {
         'auc': auc,
         'youden_threshold': youden_threshold,
@@ -210,7 +258,14 @@ def eval_distribution(exp_dir, config_path, batch_size=64, num_workers=4, limit=
             'youden': metrics_youden,
             'best_f1': metrics_bestf1
         },
-        'brier': brier
+        'brier': brier,
+        # Add probabilistic metrics
+        'ece': ece,
+        'nll': nll,
+        'calibration_curve': {
+            'prob_true': prob_true.tolist(),
+            'prob_pred': prob_pred.tolist()
+        }
     }
 
     # print summary
@@ -221,6 +276,8 @@ def eval_distribution(exp_dir, config_path, batch_size=64, num_workers=4, limit=
     print(f"Youden threshold: {youden_threshold:.6f}")
     print(f"Best-F1 threshold: {best_f1_thr:.6f}")
     print(f"Brier score: {brier:.6f}")
+    print(f"ECE: {ece:.6f}")
+    print(f"NLL: {nll:.6f}")
     print("\nPer-threshold metrics:")
     for k, v in out['per_threshold'].items():
         print(f" - {k}: threshold={v['threshold']}, acc={v['accuracy']:.4f}, prec={v['precision']:.4f}, recall={v['recall']:.4f}, f1={v['f1']:.4f}, spec={v['specificity']:.4f}, tn={v['tn']}, fp={v['fp']}, fn={v['fn']}, tp={v['tp']}")

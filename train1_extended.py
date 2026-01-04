@@ -37,6 +37,30 @@ from sklearn.metrics import roc_auc_score
 from data_utils import PDVolDataset, PatchDataset, BagDataset
 from models_patch import ResNet3D_PatchClassifier, PatchMILAggregator, build_patch_model
 from metrics import compute_metrics
+from train_evidence_aggregation import train_evidence_aggregation
+from utils.bayesian_refine_extended import (
+    variational_subject_conditional_refine,
+    mcmc_patch_refine,
+    adaptive_hyperparameters,
+    multi_scale_refine,
+    robust_spatial_soft_refine,
+    convert_patch_scores_to_dict,
+    build_patch_neighbors,
+    mil_pooling_from_patch_scores
+)
+from utils.bayesian_refine import (
+    subject_conditional_soft_refine,
+    spatial_soft_refine
+)
+
+
+def convert_patch_scores_to_dict(patch_scores):
+    result = {}
+    for (sid, pidx), score in patch_scores.items():
+        if sid not in result:
+            result[sid] = []
+        result[sid].append(score)
+    return result
 
 
 def _load_model_weights(model, ckpt_path, device):
@@ -175,8 +199,8 @@ def auto_tune_batch_and_workers(model, dataset, device, cfg):
         budget = max(0, target - reserved)
         max_by_mem = max(1, budget // est_per_sample)
         
-        # 限制在配置的 4 倍以内，且最高不超过 1024，平衡显存与稳定性
-        tuned_bs = max(1, int(min(max_by_mem, bs_cfg * 4, 1024)))
+        # 限制在配置的 4 倍以内，且最高不超过 512，平衡显存与稳定性
+        tuned_bs = max(1, int(min(max_by_mem, bs_cfg * 4, 512)))
         # 确保是 n_gpus 的倍数，方便平分
         tuned_bs = (tuned_bs // n_gpus) * n_gpus
         
@@ -477,10 +501,12 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
     # 先基于预训练patch数据集做一次显存/CPU估计
     try:
         tuned_bs, tuned_workers = auto_tune_batch_and_workers(model, patch_train_dataset, device, cfg)
+        # 确保batch_size至少为1
+        tuned_bs = max(1, tuned_bs)
     except Exception as e:
         print(f"[TUNE] 自动调参失败: {e}. 使用配置值继续")
         tuned_bs, tuned_workers = batch_size_cfg, int(cfg['train'].get('num_workers', 4))
-    batch_size = tuned_bs
+    batch_size = max(1, tuned_bs)  # 额外保护，确保不为0
     nw = int(cfg['train'].get('num_workers', 4))
     pin_mem = bool(cfg['train'].get('pin_memory', True)) and (device.type == 'cuda')
     prefetch = int(cfg['train'].get('prefetch_factor', 2))
@@ -571,11 +597,41 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
         print("[RESUME] 检测到已完成预训练，跳过 Stage 2")
     
     # =====================
-    # 3. 迭代重标阶段
+    # 3. 迭代重标阶段 - 受控EM-like过程
     # =====================
-    n_iters = cfg['train'].get('n_relabel_iters', 3)
+    # 限制重标轮数 ≤ 3，避免self-confirmation bias
+    n_iters = min(cfg['train'].get('n_relabel_iters', 3), 3)
     high_conf_threshold = cfg['train'].get('high_conf_threshold', 0.8)
     low_conf_threshold = cfg['train'].get('low_conf_threshold', 0.2)
+
+    # 自适应epoch调度：第一轮长，后面逐轮缩短
+    finetune_epochs_schedule = cfg['train'].get('finetune_epochs_schedule', [5, 3, 2])  # 默认递减
+    finetune_epochs_schedule = finetune_epochs_schedule[:n_iters]  # 截取到实际轮数
+
+    # 学习率调度：逐轮衰减
+    lr_decay_schedule = cfg['train'].get('lr_decay_schedule', [0.3, 0.1, 0.05])  # 相对基础lr
+    lr_decay_schedule = lr_decay_schedule[:n_iters]
+
+    # 自动停止信号跟踪
+    uncertainty_history = []
+    auc_history = []
+    early_stop_threshold = cfg['train'].get('early_stop_threshold', 0.01)  # 不确定性下降阈值
+
+    # 算法优化：超参数自适应
+    if cfg['train'].get('adaptive_hyperparams', False):
+        print("  执行超参数自适应...")
+        # 先计算patch_scores用于自适应
+        temp_patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers, cfg=cfg)
+        temp_subject_scores = mil_pooling_from_patch_scores(temp_patch_scores, cfg['train'].get('k_ratio', 0.15))
+        
+        # 使用训练集的子集作为val进行自适应
+        val_patch_scores = {k: v for i, (k, v) in enumerate(temp_patch_scores.items()) if i % 10 == 0}  # 10%作为val
+        train_patch_scores = {k: v for k, v in temp_patch_scores.items() if k not in val_patch_scores}
+        val_subject_scores = mil_pooling_from_patch_scores(val_patch_scores, cfg['train'].get('k_ratio', 0.15))
+        best_params = adaptive_hyperparameters(train_patch_scores, temp_subject_scores, val_patch_scores, val_subject_scores)
+        cfg['train']['alpha'] = best_params['alpha']
+        cfg['train']['lambda_spatial'] = best_params['lambda_spatial']
+        print(f"  自适应超参数: alpha={best_params['alpha']}, lambda_spatial={best_params['lambda_spatial']}")
     
     patch_train_dataset_refined = None
     train_loader_refined = None
@@ -591,23 +647,48 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
         patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers, cfg=cfg)
         
         # 重标高置信patch
-        refined_labels, stats = relabel_patches(
-            patch_scores,
-            high_conf_threshold=high_conf_threshold,
-            low_conf_threshold=low_conf_threshold
-        )
-        
-        print(f"  重标统计: 高置信正样本={stats['high_conf_pos']}, "
-              f"高置信负样本={stats['high_conf_neg']}, "
-              f"总重标={stats['total_relabeled']}")
+        # 先做 subject-level 推理
+        subject_scores = mil_pooling_from_patch_scores(patch_scores, cfg['train'].get('k_ratio', 0.15))
+
+        # 构建patch邻居
+        patch_index_map = {pid: pid[1] if isinstance(pid[1], tuple) and len(pid[1]) == 3 else (pid[1], 0, 0) if isinstance(pid[1], (int, float)) else (0,0,0) for pid in patch_scores.keys()}
+        patch_neighbors = build_patch_neighbors(patch_index_map)
+
+        # 扩展Bayesian框架：选择VI或MCMC
+        use_vi = cfg['train'].get('use_variational_inference', True)  # 默认使用VI
+        use_mcmc = cfg['train'].get('use_mcmc', False)
+
+        if use_vi:
+            print("  使用变分推断进行subject-conditional refine...")
+            patch_probs_subject, uncertainties = variational_subject_conditional_refine(patch_scores, subject_scores)
+        elif use_mcmc:
+            print("  使用MCMC采样进行subject-conditional refine...")
+            patch_probs_subject, uncertainties = mcmc_patch_refine(patch_scores, subject_scores)
+        else:
+            # 回退到原有方法
+            patch_scores_dict = convert_patch_scores_to_dict(patch_scores)
+            patch_probs_subject, _ = subject_conditional_soft_refine(patch_scores_dict, subject_scores, alpha=1.5)
+
+        # 多尺度建模（如果有slice信息）
+        slice_probs = None  # TODO: 从数据中提取slice级概率
+        # 使用第一个subject的概率作为volume级估计，或者使用平均值
+        volume_prob = list(subject_scores.values())[0] if subject_scores else 0.5
+        patch_probs_subject = multi_scale_refine(patch_probs_subject, slice_probs, volume_prob)
+
+        # 鲁棒性提升的空间一致性修正
+        patch_scores_refined = robust_spatial_soft_refine(patch_probs_subject, patch_neighbors, lambda_spatial=0.3, n_iters=2, noise_std=0.05, mc_dropout=0.1)
+
+        # 统计：计算soft更新的数量和不确定性
+        stats = {'soft_updated': len(patch_scores_refined), 'mean_uncertainty': np.mean(list(uncertainties.values())) if uncertainties else 0}
+        print(f"  重标统计: 软更新patch数={stats['soft_updated']}, 平均不确定性={stats['mean_uncertainty']:.4f}")
         
         # 用重标后的标签创建新数据集
         patch_train_dataset_refined = PatchDataset(
             base_dataset=train_dataset,
             patch_size=patch_size,
             stride=stride,
-            patch_labels=refined_labels,
-            mode='finetune'
+            patch_labels=patch_scores_refined,  # 👈 soft label
+            mode='finetune_soft'
         )
         
         train_loader_refined = DataLoader(
@@ -621,46 +702,90 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
             prefetch_factor=1 if train_workers > 0 else None
         )
         
-        # 微调
-        finetune_epochs = cfg['train'].get('finetune_epochs', 5)
-        lr_ft = float(cfg['train'].get('lr', 1e-4)) * 0.5
+        # 微调 - 自适应epoch数和学习率
+        current_finetune_epochs = finetune_epochs_schedule[iter_idx] if iter_idx < len(finetune_epochs_schedule) else 2
+        current_lr_decay = lr_decay_schedule[iter_idx] if iter_idx < len(lr_decay_schedule) else 0.05
+
+        lr_ft = float(cfg['train'].get('lr', 1e-4)) * current_lr_decay
         wd_ft = float(cfg['train'].get('weight_decay', 1e-5))
         opt_finetune = Adam(
             model.parameters(),
             lr=lr_ft,
             weight_decay=wd_ft
         )
-        
-        for epoch in range(finetune_epochs):
+
+        print(f"  微调配置: {current_finetune_epochs} epochs, lr={lr_ft:.2e}")
+
+        best_iter_auc = 0.0
+        for epoch in range(current_finetune_epochs):
             train_loss = train_epoch(model, train_loader_refined, opt_finetune, device, cfg)
             metrics, val_loss = evaluate(model, val_loader, device, cfg)
-            
+
+            current_auc = metrics['auc']
+            best_iter_auc = max(best_iter_auc, current_auc)
+
             if (epoch + 1) % 2 == 0:
-                print(f"    微调 Epoch {epoch+1}/{finetune_epochs} - "
-                      f"训练损失: {train_loss:.4f}, 验证AUC: {metrics['auc']:.4f}")
-        
+                print(f"    微调 Epoch {epoch+1}/{current_finetune_epochs} - "
+                      f"训练损失: {train_loss:.4f}, 验证AUC: {current_auc:.4f}")
+
+        # 记录历史用于自动停止
+        uncertainty_history.append(stats['mean_uncertainty'])
+        auc_history.append(best_iter_auc)
+
+        # 自动停止检查
+        should_stop = False
+        if len(uncertainty_history) >= 2:
+            uncertainty_drop = uncertainty_history[-2] - uncertainty_history[-1]
+            if uncertainty_drop < early_stop_threshold:
+                print(f"  🔄 自动停止检测: 不确定性下降 {uncertainty_drop:.4f} < {early_stop_threshold}, 停止重标")
+                should_stop = True
+
+        if len(auc_history) >= 3 and auc_history[-1] <= auc_history[-2] <= auc_history[-3]:
+            print("  🔄 自动停止检测: AUC连续下降, 停止重标")
+            should_stop = True
+
         # 保存迭代检查点
         ckpt_path = os.path.join(output_dir, f'relabel_iter{iter_idx+1}.pth')
         state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
         torch.save(state_dict, ckpt_path)
         print(f"  保存检查点: {ckpt_path}")
 
+        if should_stop and iter_idx >= 1:  # 至少完成1轮
+            print(f"  ✅ 触发自动停止，提前结束重标 (完成 {iter_idx+1}/{n_iters} 轮)")
+            break
+
     # 如果 Stage 3 被完全跳过(例如 n_iters=0 或 resume 到 n_iters), 仍需构建 refined 数据集供 Stage 4 使用
     if patch_train_dataset_refined is None:
         print("\n[Stage 3] 未执行迭代重标循环，重算一次 refined labels 以进入 Stage 4...")
         patch_scores = infer_patch_scores(model, patch_train_dataset, device, batch_size, num_workers=train_workers, cfg=cfg)
-        refined_labels, stats = relabel_patches(
-            patch_scores,
+        # 1. 先算 subject-level score
+        subject_scores = mil_pooling_from_patch_scores(patch_scores, cfg['train'].get('k_ratio', 0.15))
+
+        # 构建patch邻居
+        patch_index_map = {pid: pid[1] if isinstance(pid[1], tuple) and len(pid[1]) == 3 else (pid[1], 0, 0) if isinstance(pid[1], (int, float)) else (0,0,0) for pid in patch_scores.keys()}
+        patch_neighbors = build_patch_neighbors(patch_index_map)
+
+        # 2. subject-conditional soft refine
+        patch_scores_dict = convert_patch_scores_to_dict(patch_scores)
+        refined_probs, stats = subject_conditional_soft_refine(
+            patch_scores_dict,
+            subject_scores,
+            alpha=1.5,
+            freeze_high_conf=True,
             high_conf_threshold=high_conf_threshold,
             low_conf_threshold=low_conf_threshold
         )
-        print(f"  重标统计(补算): 高置信正样本={stats['high_conf_pos']}, 高置信负样本={stats['high_conf_neg']}, 总重标={stats['total_relabeled']}")
+
+        # 3. 空间一致性 soft 修正
+        refined_probs = spatial_soft_refine(refined_probs, patch_neighbors, lambda_spatial=0.3, n_iters=2)
+
+        print(f"  重标统计(补算): 冻结高置信={stats['frozen_high_conf']}, 软更新={stats['soft_updated']}, 总重标={stats['frozen_high_conf'] + stats['soft_updated']}")
         patch_train_dataset_refined = PatchDataset(
             base_dataset=train_dataset,
             patch_size=patch_size,
             stride=stride,
-            patch_labels=refined_labels,
-            mode='finetune'
+            patch_labels=refined_probs,  # soft
+            mode='finetune_soft'
         )
         train_loader_refined = DataLoader(
             patch_train_dataset_refined,
@@ -706,7 +831,7 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
     else:
         model.unfreeze_backbone()
     
-    lr_full = float(cfg['train'].get('lr', 1e-4)) * 0.1
+    lr_full = float(cfg['train'].get('lr', 1e-4)) * 0.3  # 从0.1增加到0.3，更激进的联合微调
     wd_full = float(cfg['train'].get('weight_decay', 1e-5))
     opt_full = Adam(
         model.parameters(),
@@ -714,7 +839,7 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
         weight_decay=wd_full
     )
     
-    final_epochs = cfg['train'].get('final_epochs', 10)
+    final_epochs = cfg['train'].get('backbone_finetune_epochs', 10)
     best_final_auc = 0.0
     
     for epoch in range(final_epochs):
@@ -749,6 +874,15 @@ def train_patch_mil(cfg, output_dir='outputs/patch_mil', resume=None):
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     print(f"[INFO] 元数据已保存: {metadata_path}")
+    
+    # 默认训练 Evidence Aggregation
+    base_model = os.path.join(output_dir, 'final_best.pth')
+    if os.path.exists(base_model):
+        cfg_path = args.config if hasattr(args, 'config') else 'config.yaml'
+        device = cfg['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        train_evidence_aggregation(cfg_path, base_model, output_dir, device=device)
+    else:
+        print(f"[WARN] base_model {base_model} 不存在，跳过 Evidence Aggregation")
 
 
 def collate_bag_batch(batch):
@@ -799,7 +933,7 @@ def train_attention_stage(cfg, output_dir, base_model_path):
     loss_fn = get_loss_fn(cfg)
     
     best_auc = 0.0
-    epochs = cfg['train'].get('final_epochs', 10)
+    epochs = cfg['train'].get('aggregator_epochs', 10)
     
     for epoch in range(epochs):
         aggregator.train()
@@ -863,8 +997,9 @@ if __name__ == '__main__':
     parser.add_argument('--out_dir', type=str, default='outputs/patch_mil', help='输出目录')
     parser.add_argument('--synthetic', action='store_true', help='使用合成数据进行测试')
     parser.add_argument('--resume', type=str, default=None, help="续训: auto 或 checkpoint 路径")
-    parser.add_argument('--stage5', action='store_true', help='仅运行 Stage 5 (Attention 微调)')
-    parser.add_argument('--base_model', type=str, default=None, help='Stage 5 所需的基础模型路径')
+    parser.add_argument('--stage5', action='store_true', help='仅运行 Stage 5 (Attention 微调) - 已废弃，请使用 --evidence_agg')
+    parser.add_argument('--evidence_agg', action='store_true', help='仅运行 Evidence Aggregation 训练')
+    parser.add_argument('--base_model', type=str, default=None, help='Evidence Aggregation 所需的基础模型路径')
     
     args = parser.parse_args()
     
@@ -876,10 +1011,14 @@ if __name__ == '__main__':
         cfg['data']['val_csv'] = None
     
     if args.stage5:
+        print("[WARN] --stage5 已废弃，请使用 --evidence_agg")
+        args.evidence_agg = True
+    if args.evidence_agg:
         if not args.base_model:
             # 尝试自动寻找
             args.base_model = os.path.join(args.out_dir, 'final_best.pth')
-        train_attention_stage(cfg, args.out_dir, args.base_model)
+        device = cfg['train'].get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        train_evidence_aggregation(args.config, args.base_model, args.out_dir, device=device)
     else:
         train_patch_mil(cfg, output_dir=args.out_dir, resume=args.resume)
 
